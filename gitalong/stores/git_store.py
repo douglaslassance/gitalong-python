@@ -3,11 +3,13 @@ import os
 import typing
 
 import git
+import git.exc
 from git.repo import Repo
 
 from ..exceptions import RepositoryInvalidConfig
 from ..functions import pulled_within
 from ..store import Store
+from ..commit import Commit
 
 
 class GitStore(Store):
@@ -41,10 +43,10 @@ class GitStore(Store):
             )
 
     @property
-    def commits(self) -> typing.List[dict]:
+    def commits(self) -> typing.List[Commit]:
         """
         Returns:
-            typing.List[dict]:
+            typing.List[Commit]:
                 A list of commits that haven't been pushed to remote. Also includes
                 commits representing uncommitted changes.
         """
@@ -52,8 +54,8 @@ class GitStore(Store):
         remote = store_repository.remote()
         pull_threshold = self._managed_repository.config.get("pull_threshold", 60)
         if not pulled_within(store_repository, pull_threshold) and remote.refs:
-            # TODO: If we could check that a pull is already happening then we could
-            # avoid this try except and save time.
+            # TODO: We could check that a pull is already happening thus avoiding this
+            # try except and save time.
             try:
                 remote.pull(
                     ff=True,
@@ -69,10 +71,15 @@ class GitStore(Store):
         if os.path.exists(self._local_json_path):
             with open(self._local_json_path, "r", encoding="utf-8") as _file:
                 serializable_commits = json.loads(_file.read())
-        return serializable_commits
+        commits = []
+        for serializable_commit in serializable_commits:
+            commit = Commit(self._managed_repository)
+            commit.update(serializable_commit)
+            commits.append(commit)
+        return commits
 
     @commits.setter
-    def commits(self, commits: typing.List[dict]):
+    def commits(self, commits: typing.List[Commit]):
         self._write_local_json(commits)
         self._store_repository.index.add(self._local_json_path)
         basename = os.path.basename(self._local_json_path)

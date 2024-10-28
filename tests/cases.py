@@ -1,15 +1,24 @@
+# pylint: disable=missing-function-docstring
+# pylint: disable=missing-class-docstring
+# pylint: disable=attribute-defined-outside-init
+
 import getpass
 import logging
 import os
 import shutil
 import socket
 import unittest
+import asyncio
 
 from click.testing import CliRunner
 from git.repo import Repo
 
-from gitalong import Repository, CommitSpread, RepositoryNotSetup, cli
+from gitalong import Repository, CommitSpread, Commit, RepositoryNotSetup, cli
 from gitalong.functions import is_read_only
+
+# Deliberatedly import the module to avoid circular imports.
+import gitalong.batch as batch
+
 from .functions import save_image
 
 
@@ -36,7 +45,7 @@ class GitalongCase(unittest.TestCase):
         self.repository = Repository.setup(
             store_url=store_url,
             store_headers=store_headers,
-            managed_repository=self._managed_clone.working_dir,
+            managed_repository=str(self._managed_clone.working_dir),
             modify_permissions=True,
             track_binaries=True,
             track_uncommitted=True,
@@ -50,7 +59,7 @@ class GitalongCase(unittest.TestCase):
         config = self.repository.config
         self.assertEqual(
             os.path.normpath(self._store_url),
-            os.path.normpath(config.get("store_url")),
+            os.path.normpath(config.get("store_url", "")),
         )
 
     def test_lib(self):
@@ -79,14 +88,14 @@ class GitalongCase(unittest.TestCase):
         self.assertEqual(1, len(local_only_commits))
         self.assertEqual(3, len(local_only_commits[0]["changes"]))
 
-        image_path = os.path.join(working_dir, "staged_image_02.jpg")
-        save_image(image_path)
+        staged_image_02_path = os.path.join(working_dir, "staged_image_02.jpg")
+        save_image(staged_image_02_path)
         # Simulating the application syncing when saving the file.
         self.repository.update_tracked_commits()
         # print("POST-SAVE TRACKED COMMITS")
         # pprint(self.repository.get_tracked_commits())
 
-        self._managed_clone.index.add(image_path)
+        self._managed_clone.index.add(staged_image_02_path)
         self._managed_clone.index.commit(message="Add staged_image_02.jpg")
         # Simulating the post-commit hook.
         self.repository.update_tracked_commits()
@@ -101,8 +110,9 @@ class GitalongCase(unittest.TestCase):
         # pprint(self.repository.get_tracked_commits())
 
         # We just pushed the changes therefore there should be no missing commit.
-        last_commit = self.repository.get_file_last_commit("staged_image_02.jpg")
-        spread = self.repository.get_commit_spread(last_commit)
+        last_commits = asyncio.run(batch.get_files_last_commits([staged_image_02_path]))
+        last_commit = last_commits[0] if last_commits else Commit(None)
+        spread = last_commit.commit_spread
         self.assertEqual(
             CommitSpread.MINE_ACTIVE_BRANCH | CommitSpread.REMOTE_MATCHING_BRANCH,
             spread,
@@ -110,28 +120,33 @@ class GitalongCase(unittest.TestCase):
 
         # We are dropping the last commit locally.
         self._managed_clone.git.reset("--hard", commit.hexsha)
+
         # Simulating the post-checkout hook.
         self.repository.update_tracked_commits()
-        # print("POST-CHECKOUT TRACKED COMMITS")
-        # pprint(self.repository.get_tracked_commits())
 
         # As a result it should be a commit we do no have locally.
-        last_commit = self.repository.get_file_last_commit("staged_image_02.jpg")
-        spread = self.repository.get_commit_spread(last_commit)
+        last_commits = asyncio.run(batch.get_files_last_commits([staged_image_02_path]))
+        last_commit = last_commits[0] if last_commits else Commit(None)
+        spread = last_commit.commit_spread
         self.assertEqual(CommitSpread.REMOTE_MATCHING_BRANCH, spread)
 
         self.assertEqual(False, is_read_only(staged_image_01_path))
         self.assertEqual(False, is_read_only(self.repository.config_path))
+
         self.repository.update_file_permissions(staged_image_01_path)
         self.assertEqual(True, is_read_only(staged_image_01_path))
+
         self.repository.update_file_permissions(self.repository.config_path)
         self.assertEqual(False, is_read_only(self.repository.config_path))
 
         self.repository.update_tracked_commits()
 
-        missing_commit = self.repository.make_file_writable(staged_image_01_path)
+        claims = asyncio.run(
+            batch.claim_files([staged_image_01_path, staged_image_02_path])
+        )
+        missing_commit = claims[0]
         self.assertEqual(False, bool(missing_commit))
-        missing_commit = self.repository.make_file_writable(image_path)
+        missing_commit = claims[1]
         self.assertEqual(True, bool(missing_commit))
 
     def test_cli(self):
@@ -172,6 +187,13 @@ class GitalongCase(unittest.TestCase):
         host = socket.gethostname()
         user = getpass.getuser()
         output = f"+------- {untracked_image_01} - - - {host} {user}\n"
+        self.assertEqual(output, result.output)
+
+        result = runner.invoke(cli.claim, [untracked_image_01], obj=obj)
+        self.assertEqual(0, result.exit_code, result.output)
+        host = socket.gethostname()
+        user = getpass.getuser()
+        output = f"-------- {untracked_image_01} - - - - -\n"
         self.assertEqual(output, result.output)
 
     def tearDown(self):

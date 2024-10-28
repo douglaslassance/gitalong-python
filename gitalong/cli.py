@@ -1,33 +1,23 @@
 import os
-import sys
 import pstats
 import cProfile
+import asyncio
 
 import click
 import git
+import git.exc
+
 from click.decorators import pass_context
 
 from .__info__ import __version__
+
 from .enums import CommitSpread
-from .exceptions import RepositoryNotSetup
 from .repository import Repository
-from .functions import set_read_only
+from .batch import get_files_last_commits, claim_files
 
 
-def get_repository(  # pylint: disable=missing-function-docstring
-    repository: str,
-) -> Repository:
-    try:
-        # Initializing Gitalong for each file allows to handle files from multiple
-        # repository. This is especially import to support submodules.
-        return Repository(repository=repository, use_cached_instances=True)
-    except RepositoryNotSetup:
-        return None
-
-
-def get_status(repository, filename, commit) -> str:
+def get_status_string(filename: str, commit: dict, spread: int) -> str:
     """TODO: Add proper offline support."""
-    spread = repository.get_commit_spread(commit) if repository else 0
     prop = "+" if spread & CommitSpread.MINE_UNCOMMITTED else "-"
     prop += "+" if spread & CommitSpread.MINE_ACTIVE_BRANCH else "-"
     prop += "+" if spread & CommitSpread.MINE_OTHER_BRANCH else "-"
@@ -69,57 +59,46 @@ def version():  # pylint: disable=missing-function-docstring
 )
 @click.pass_context
 def config(ctx, prop):  # pylint: disable=missing-function-docstring
-    repository = get_repository(ctx.obj.get("REPOSITORY", ""))
-    if repository:
-        repository_config = repository.config
-        prop = prop.replace("-", "_")
-        if prop in repository_config:
-            value = repository_config[prop]
-            if isinstance(value, bool):
-                value = str(value).lower()
-            click.echo(value)
+    repository = Repository.from_filename(ctx.obj.get("REPOSITORY", ""))
+    repository_config = repository.config if repository else {}
+    prop = prop.replace("-", "_")
+    if prop in repository_config:
+        value = repository_config[prop]
+        if isinstance(value, bool):
+            value = str(value).lower()
+        click.echo(value)
 
 
 @click.command(
     help=(
         "Update tracked commits with the local changes of this clone. echo a list of "
-        "files that were made "
+        "files their permissions changed."
     )
 )
-@click.argument(
-    "repository",
-    nargs=-1,
-    # help="The path to the file that should be made writable."
-)
 @click.pass_context
-def update(ctx, repository):
+def update(ctx):
     """TODO: Improve error handling."""
-    repositories = repository or []
-    repositories = list(repositories)
-    repositories.insert(0, ctx.obj.get("REPOSITORY", ""))
-    synced = set()
-    perm_changes = []
+    repository = Repository.from_filename(ctx.obj.get("REPOSITORY", ""))
+    if not repository:
+        return
+    working_dir = repository.working_dir
+    repository.update_tracked_commits()
     locally_changed = {}
-    for repo_filename in repositories:
-        repository = get_repository(repo_filename)
-        root = repository.working_dir if repository else ""
-        # We are not syncing the same repository twice.
-        if not root or root in synced:
-            continue
-        repository.update_tracked_commits()
-        synced.add(root)
-        if repository.config.get("modify_permissions"):
-            for filename in repository.files:
-                if os.path.isfile(repository.get_absolute_path(filename)):
-                    if root not in locally_changed:
-                        locally_changed[root] = repository.locally_changed_files
-                    perm_change = repository.update_file_permissions(
-                        filename, locally_changed[root]
-                    )
-                    if perm_change:
-                        perm_changes.append(f"{' '.join(perm_change)}")
-    if perm_changes:
-        click.echo("\n".join(perm_changes))
+    permission_changes = []
+    if repository.config.get("modify_permissions"):
+        # TODO: This is an expensive operation and needs to be optimized.
+        # Also probably should not be done here at the CLI level.
+        for filename in repository.files:
+            if os.path.isfile(repository.get_absolute_path(filename)):
+                if working_dir not in locally_changed:
+                    locally_changed[working_dir] = repository.locally_changed_files
+                perm_change = repository.update_file_permissions(
+                    filename, locally_changed[working_dir]
+                )
+                if perm_change:
+                    permission_changes.append(f"{' '.join(perm_change)}")
+    if permission_changes:
+        click.echo("\n".join(permission_changes))
 
 
 @click.command(
@@ -133,13 +112,16 @@ def update(ctx, repository):
 @click.argument(
     "filename",
     nargs=-1,
-    # help="The path to the file that should be made writable."
+    # help="The paths to the files that should be made writable."
 )
 @click.option(
     "-p",
     "--profile",
     is_flag=True,
-    help="Will generate a profile file in the current workin directory.",
+    help=(
+        "Will generate a profile file in the current workin directory."
+        "The file can be open in a profiler like snakeviz."
+    ),
 )
 @click.pass_context
 def status(ctx, filename, profile=False):  # pylint: disable=missing-function-docstring
@@ -153,16 +135,16 @@ def status(ctx, filename, profile=False):  # pylint: disable=missing-function-do
 
 
 def run_status(ctx, filename):  # pylint: disable=missing-function-docstring
-    statuses = []
-    repo_filename = ctx.obj.get("REPOSITORY", "")
-    for _filename in filename:
-        repo_filename = repo_filename or _filename
-        commit = {}
-        repository = get_repository(repo_filename)
-        if repository:
-            commit = repository.get_file_last_commit(_filename)
-        statuses.append(get_status(repository, _filename, commit))
-    click.echo("\n".join(statuses), err=False)
+    file_status = []
+    commits = asyncio.run(get_files_last_commits(filename))
+    for _filename, commit in zip(filename, commits):
+        repository = Repository.from_filename(ctx.obj.get("REPOSITORY", _filename))
+        absolute_filename = (
+            repository.get_absolute_path(_filename) if repository else _filename
+        )
+        spread = commit.commit_spread if repository else 0
+        file_status.append(get_status_string(absolute_filename, commit, spread))
+    click.echo("\n".join(file_status), err=False)
 
 
 @click.command(
@@ -174,35 +156,21 @@ def run_status(ctx, filename):  # pylint: disable=missing-function-docstring
 @click.argument(
     "filename",
     nargs=-1,
-    # help="The path to the file that should be made writable."
+    # help="The paths to the files that should be made writable."
 )
 @pass_context
 def claim(ctx, filename):  # pylint: disable=missing-function-docstring
-    repo_filename = ctx.obj.get("REPOSITORY", "")
     statuses = []
-    claimables = []
-    error = False
-    for _filename in filename:
-        commit = {}
-        repo_filename = repo_filename or _filename
-        repository = get_repository(repo_filename)
-        if repository:
-            commit = repository.make_file_writable(_filename)
-        statuses.append(get_status(repository, _filename, commit))
-        claimables.append(_filename)
-        if commit:
-            error = True
+    blocking_commits = asyncio.run(claim_files(filename))
+    for _filename, commit in zip(filename, blocking_commits):
+        repository = Repository.from_filename(ctx.obj.get("REPOSITORY", _filename))
+        absolute_filename = (
+            repository.get_absolute_path(_filename) if repository else _filename
+        )
+        spread = commit.commit_spread if repository else 0
+        statuses.append(get_status_string(absolute_filename, commit, spread))
     if statuses:
         click.echo("\n".join(statuses))
-    if error:
-        sys.exit(1)
-    repository.update_tracked_commits(claims=claimables)
-    if repository.config.get("modify_permissions"):
-        if os.path.isfile(repository.get_absolute_path(filename)):
-            set_read_only(
-                repository.get_absolute_path(filename),
-                read_only=False,
-            )
 
 
 @click.command(help="Setup Gitalong in a repository.")

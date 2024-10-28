@@ -1,3 +1,7 @@
+# pylint: disable=missing-function-docstring
+# pylint: disable=missing-class-docstring
+# pylint: disable=attribute-defined-outside-init
+
 import tempfile
 from unittest.mock import patch, MagicMock
 
@@ -24,7 +28,9 @@ class JsonbinStoreTestCase(GitalongCase):
 
         self._setup_repository(temp_dir, url, store_headers=self._store_headers)
 
-    def _get_patch(self, url, headers=None, timeout=0):
+    def _get_patch(
+        self, url, headers=None, timeout=0
+    ):  # pylint: disable=unused-argument
         self.assertEqual(url, self._store_url)
         self.assertDictEqual(headers or {}, self._store_headers)
         mock_response = MagicMock()
@@ -32,7 +38,9 @@ class JsonbinStoreTestCase(GitalongCase):
         mock_response.json.return_value = self._stored_value
         return mock_response
 
-    def _put_patch(self, url, headers=None, timeout=0, json=None):
+    def _put_patch(
+        self, url, headers=None, timeout=0, json=None
+    ):  # pylint: disable=unused-argument
         self.assertEqual(url, self._store_url)
         store_headers = {"Content-Type": "application/json"}
         store_headers.update(self._store_headers)

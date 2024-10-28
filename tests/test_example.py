@@ -1,6 +1,7 @@
 import os
 import tempfile
 import logging
+import asyncio
 
 from git.repo import Repo
 from gitalong import Repository, RepositoryNotSetup, CommitSpread
@@ -17,7 +18,7 @@ def test_example():
 
     try:
         # This will raise as we never setup that repository with Gitalong.
-        repository = Repository(project_clone.working_dir)
+        repository = Repository(str(project_clone.working_dir))
 
     except RepositoryNotSetup:
 
@@ -30,8 +31,8 @@ def test_example():
         # This will clone the registry repository in an ignored `.gitalong` folder.
         # It will also start tracking a `.gitalong.json` configuration file.
         repository = Repository.setup(
-            store_url=store.working_dir,
-            managed_repository=project_clone.working_dir,
+            store_url=str(store.working_dir),
+            managed_repository=str(project_clone.working_dir),
             modify_permissions=True,
             tracked_extensions=[".jpg", ".gif", ".png"],
             track_uncommitted=True,
@@ -41,10 +42,14 @@ def test_example():
         )
 
     # Creating some files.
-    open(os.path.join(project_clone.working_dir, "uncommitted.png"), "w").close()
-    open(os.path.join(project_clone.working_dir, "local.gif"), "w").close()
-    open(os.path.join(project_clone.working_dir, "remote.jpg"), "w").close()
-    open(os.path.join(project_clone.working_dir, "untracked.txt"), "w").close()
+    uncomitted = os.path.join(project_clone.working_dir, "uncommitted.png")
+    local = os.path.join(project_clone.working_dir, "local.gif")
+    remote = os.path.join(project_clone.working_dir, "remote.jpg")
+    untracked = os.path.join(project_clone.working_dir, "untracked.txt")
+    open(uncomitted, "w", encoding="utf-8").close()
+    open(local, "w", encoding="utf-8").close()
+    open(remote, "w", encoding="utf-8").close()
+    open(untracked, "w", encoding="utf-8").close()
 
     # Spreading them across branches.
     project_clone.index.add("untracked.txt")
@@ -61,26 +66,30 @@ def test_example():
     repository.update_tracked_commits()
 
     # Update permissions of all files based on track commits. Because
-    # `modify_permssions` was passed this will update all permissions of tracked files.
+    # `modify_permissions` was passed this will update all permissions of tracked files.
     # Permission updates currently comes at high performance cost and is not
     # recommended.
     locally_changed_files = repository.locally_changed_files
     for filename in repository.files:
         repository.update_file_permissions(filename, locally_changed_files)
 
+    last_commits = asyncio.run(
+        repository.batch.get_files_last_commits([uncomitted, local, remote, untracked])
+    )
+
     # Now we'll get the last commit for our files.
     # This could return a dummy commit representing uncommitted changes.
-    uncommitted_last_commit = repository.get_file_last_commit("uncommitted.png")
-    local_last_commit = repository.get_file_last_commit("local.gif")
-    remote_last_commit = repository.get_file_last_commit("remote.jpg")
-    untracked_last_commit = repository.get_file_last_commit("untracked.txt")
+    uncommitted_last_commit = last_commits[0]
+    local_last_commit = last_commits[1]
+    remote_last_commit = last_commits[2]
+    untracked_last_commit = last_commits[3]
 
     # Getting the commit spreads.
     # Spread flags represent where the commit live.
-    uncommitted_spread = repository.get_commit_spread(uncommitted_last_commit)
-    local_spread = repository.get_commit_spread(local_last_commit)
-    remote_spread = repository.get_commit_spread(remote_last_commit)
-    untracked_spread = repository.get_commit_spread(untracked_last_commit)
+    uncommitted_spread = uncommitted_last_commit.commit_spread
+    local_spread = local_last_commit.commit_spread
+    remote_spread = remote_last_commit.commit_spread
+    untracked_spread = untracked_last_commit.commit_spread
 
     assert uncommitted_spread == CommitSpread.MINE_UNCOMMITTED
     assert local_spread == CommitSpread.MINE_ACTIVE_BRANCH
@@ -89,11 +98,15 @@ def test_example():
         CommitSpread.REMOTE_MATCHING_BRANCH | CommitSpread.MINE_ACTIVE_BRANCH
     )
 
-    # Trying to make the files writable.
-    assert bool(repository.make_file_writable("uncommitted.png")) is False
-    assert bool(repository.make_file_writable("local.gif")) is False
-    assert bool(repository.make_file_writable("remote.jpg")) is True
-    assert bool(repository.make_file_writable("untracked.txt")) is False
+    # Trying to claim the files.
+    claims = asyncio.run(
+        repository.batch.claim_files([uncomitted, local, remote, untracked])
+    )
+
+    assert bool(claims[0]) is False
+    assert bool(claims[1]) is False
+    assert bool(claims[2]) is True
+    assert bool(claims[3]) is False
 
 
 if __name__ == "__main__":

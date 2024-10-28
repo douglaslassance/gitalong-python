@@ -6,24 +6,33 @@ import logging
 import os
 import shutil
 import socket
+import asyncio
 
-from typing import List
+from typing import Optional, List
 
-import dictdiffer
 import git
-from git.repo import Repo
-from gitdb.util import hex_to_bin
+import git.exc
 
-from .enums import CommitSpread
-from .exceptions import RepositoryNotSetup, RepositoryInvalidConfig
-from .functions import get_real_path, is_binary_file
-from .functions import set_read_only, pulled_within, get_filenames_from_move_string
+from git.repo import Repo
+
+from .store import Store
 from .stores.git_store import GitStore
 from .stores.jsonbin_store import JsonbinStore
+from .exceptions import RepositoryNotSetup, RepositoryInvalidConfig
+from .functions import (
+    get_real_path,
+    is_binary_file,
+    set_read_only,
+    pulled_within,
+)
 
 
 class Repository:
-    """Aggregates all the Gitalong actions that can happen on a Git repository."""
+    """Aggregates all the Gitalong actions that can happen on a Git repository.
+
+    Raises:
+        git.exc.InvalidGitRepositoryError: If the path is not in or the Git clone.
+    """
 
     _instances = {}
     _config_basename = ".gitalong.json"
@@ -52,7 +61,8 @@ class Repository:
                 If true, the class will return "singleton" cached per clone.
 
         Raises:
-            GitalongNotInstalled: Description
+            RepositoryInvalidConfig: If the store URL is not valid.
+            RepositoryNotSetup: If Gitalong is not installed on the repository.
         """
         self._config = None
         self._submodules = None
@@ -60,7 +70,7 @@ class Repository:
         self._managed_repository = Repo(repository, search_parent_directories=True)
         self._remote = self._managed_repository.remote()
 
-        store_url = self.config.get("store_url")
+        store_url = self.config.get("store_url", "")
         if store_url.startswith("https://api.jsonbin.io"):
             self._store = JsonbinStore(self)
         elif store_url.endswith(".git"):
@@ -81,13 +91,13 @@ class Repository:
     def setup(
         cls,
         store_url: str,
-        store_headers: dict = None,
+        store_headers: Optional[dict] = None,
         managed_repository: str = "",
         modify_permissions=False,
         pull_threshold: float = 60.0,
         track_binaries: bool = False,
         track_uncommitted: bool = False,
-        tracked_extensions: list[str] = None,
+        tracked_extensions: Optional[list[str]] = None,
         update_gitignore: bool = False,
         update_hooks: bool = False,
     ):
@@ -127,8 +137,8 @@ class Repository:
                 which we just installed.
         """
         tracked_extensions = tracked_extensions or []
-        managed_repository = Repo(managed_repository, search_parent_directories=True)
-        config_path = os.path.join(managed_repository.working_dir, cls._config_basename)
+        managed_repo = Repo(managed_repository, search_parent_directories=True)
+        config_path = os.path.join(managed_repo.working_dir, cls._config_basename)
         config = {
             "store_url": store_url,
             "store_headers": store_headers or {},
@@ -139,13 +149,32 @@ class Repository:
             "track_uncommitted": track_uncommitted,
         }
         cls._write_config_file(config, config_path)
-        gitalong = cls(repository=managed_repository.working_dir)
-        # gitalong._clone_store_repository()
+        gitalong = cls(repository=str(managed_repo.working_dir))
         if update_gitignore:
             gitalong.update_gitignore()
         if update_hooks:
             gitalong.install_hooks()
         return gitalong
+
+    @classmethod
+    def from_filename(cls, filename: str) -> Optional["Repository"]:
+        """
+        Args:
+            filename (str):
+                Existing absolute path to a file or folder in the managed repository.
+                That inclused the managed repository itself.
+
+        Returns:
+            Optional[Repository]: The repository or None.
+        """
+        try:
+            return cls(repository=filename, use_cached_instances=True)
+        except git.exc.InvalidGitRepositoryError:
+            return None
+        except RepositoryNotSetup:
+            return None
+        except git.exc.NoSuchPathError:
+            return None
 
     @staticmethod
     def _write_config_file(config: dict, path: str):
@@ -153,10 +182,8 @@ class Repository:
             json.dump(config, config_file, indent=4, sort_keys=True)
 
     def update_gitignore(self):
-        """Update the .gitignore of the managed repository with Gitalong directives.
-
-        TODO: Improve update by considering what is already ignored.
-        """
+        """Update the .gitignore of the managed repository with Gitalong directives."""
+        # TODO: Improve by considering what is already ignored.
         gitignore_path = os.path.join(self.working_dir, ".gitignore")
         content = ""
         if os.path.exists(gitignore_path):
@@ -181,6 +208,14 @@ class Repository:
         return os.path.join(self.working_dir, self._config_basename)
 
     @property
+    def store(self) -> Store:
+        """
+        Returns:
+            Store: The store that Gitalong uses to keep track of local changes.
+        """
+        return self._store
+
+    @property
     def config(self) -> dict:
         """
         Returns:
@@ -197,6 +232,22 @@ class Repository:
         return self._config
 
     @property
+    def remote(self) -> git.Remote:
+        """
+        Returns:
+            git.Remote: The remote repository of the managed repository.
+        """
+        return self._remote
+
+    @property
+    def remote_url(self) -> str:
+        """
+        Returns:
+            str: The URL of the remote repository.
+        """
+        return self._remote.url
+
+    @property
     def hooks_path(self) -> str:
         """
         Returns:
@@ -208,7 +259,11 @@ class Repository:
             )
         except configparser.NoOptionError:
             basename = os.path.join(".git", "hooks")
-        return os.path.normpath(os.path.join(self.working_dir, basename))
+        path = os.path.join(
+            self.working_dir,
+            basename,  # pyright: ignore[reportCallIssue, reportArgumentType]
+        )
+        return os.path.normpath(path)
 
     def install_hooks(self):
         """Installs Gitalong hooks in managed repository.
@@ -250,199 +305,25 @@ class Repository:
             return filename
         return os.path.join(self.working_dir, filename)
 
-    def get_file_last_commit(self, filename: str, prune: bool = True) -> dict:
-        """
-        Args:
-            filename (str): Absolute or relative filename to get the last commit for.
-            prune (bool, optional): Prune branches if a fetch is necessary.
-
-        Returns:
-            dict: The last commit for the provided filename across all branches local or
-            remote.
-        """
-        # We are checking the tracked commit first as they represented local changes.
-        # They are in nature always more recent. If we find a relevant commit here we
-        # can skip looking elsewhere.
-        tracked_commits = self._store.commits
-        relevant_tracked_commits = []
-        filename = self.get_relative_path(filename)
-        remote = self._remote.url
-        last_commit = {}
-        track_uncommitted = self.config.get("track_uncommitted", False)
-        for tracked_commit in tracked_commits:
-            if (
-                # We ignore uncommitted tracked commits if configuration says so.
-                (not track_uncommitted and "sha" not in tracked_commit)
-                # We ignore commits from other remotes.
-                or tracked_commit.get("remote") != remote
-            ):
-                continue
-            for change in tracked_commit.get("changes", []):
-                if os.path.normpath(change) == os.path.normpath(filename):
-                    relevant_tracked_commits.append(tracked_commit)
-                    continue
-        if relevant_tracked_commits:
-            relevant_tracked_commits.sort(key=lambda commit: commit.get("date"))
-            last_commit = relevant_tracked_commits[-1]
-            # Because there is no post-push hook a local commit that got pushed could
-            # have never been removed from our tracked commits. To cover for this case
-            # we are checking if this commit is on remote and modify it, so it's
-            # conform to a remote commit.
-            if "sha" in last_commit and self.get_commit_branches(
-                last_commit["sha"], remote=True
-            ):
-                tracked_commits.remove(last_commit)
-                self._store.commits = tracked_commits
-                for key in self.context_dict:
-                    if key in last_commit:
-                        del last_commit[key]
-        if not last_commit:
-            pull_threshold = self.config.get("pull_threshold", 60)
-            if not pulled_within(self._managed_repository, pull_threshold):
-                try:
-                    self._remote.fetch(prune=prune)
-                except git.exc.GitCommandError:
-                    pass
-
-            # TODO: Maybe there is a way to get this information using pure Python.
-            args = ["--all", "--remotes", '--pretty=format:"%H"', "--", filename]
-            output = self._managed_repository.git.log(*args)
-            file_commits = output.replace('"', "").split("\n") if output else []
-            last_commit = (
-                self.get_commit_dict(
-                    git.objects.Commit(
-                        self._managed_repository, hex_to_bin(file_commits[0])
-                    )
-                )
-                if file_commits
-                else {}
-            )
-        if last_commit and "sha" in last_commit:
-            # We are only evaluating branch information here because it's expensive.
-            last_commit["branches"] = {
-                "local": self.get_commit_branches(last_commit["sha"]),
-                "remote": self.get_commit_branches(last_commit["sha"], remote=True),
-            }
-        return last_commit
-
-    @property
-    def active_branch_commits(self) -> list:
-        """
-        Returns:
-            list: List of all local commits for active branch.
-        """
-        active_branch = self._managed_repository.active_branch
-        return list(
-            git.objects.Commit.iter_items(self._managed_repository, active_branch)
-        )
-
-    def get_commit_spread(self, commit: dict) -> int:
-        """
-        Args:
-            commit (int): The commit to check for.
-
-        Returns:
-            dict:
-                A dictionary of commit spread information containing all
-                information about where this commit lives across branches and clones.
-        """
-        commit_spread = 0
-        active_branch = self._managed_repository.active_branch.name
-        if commit.get("user", ""):
-            is_issued = self.is_issued_commit(commit)
-            if "sha" in commit:
-                if active_branch in commit.get("branches", {}).get("local", []):
-                    commit_spread |= (
-                        CommitSpread.MINE_ACTIVE_BRANCH
-                        if is_issued
-                        else CommitSpread.THEIR_MATCHING_BRANCH
-                    )
-                else:
-                    commit_spread |= (
-                        CommitSpread.MINE_OTHER_BRANCH
-                        if is_issued
-                        else CommitSpread.THEIR_OTHER_BRANCH
-                    )
-            else:
-                commit_spread |= (
-                    CommitSpread.MINE_UNCOMMITTED
-                    if is_issued
-                    else CommitSpread.THEIR_UNCOMMITTED
-                )
-        else:
-            remote_branches = commit.get("branches", {}).get("remote", [])
-            if active_branch in remote_branches:
-                commit_spread |= CommitSpread.REMOTE_MATCHING_BRANCH
-            if active_branch in commit.get("branches", {}).get("local", []):
-                commit_spread |= CommitSpread.MINE_ACTIVE_BRANCH
-            if active_branch in remote_branches:
-                remote_branches.remove(active_branch)
-            if remote_branches:
-                commit_spread |= CommitSpread.REMOTE_OTHER_BRANCH
-        return commit_spread
-
-    @staticmethod
-    def is_uncommitted_changes_commit(commit: dict) -> bool:
-        """
-        Args:
-            commit (dict): The commit dictionary.
-
-        Returns:
-            bool: Whether the commit dictionary represents uncommitted changes.
-        """
-        return "user" in commit.keys()
-
     @property
     def uncommitted_changes_commit(self) -> dict:
         """
         Returns:
             dict: Returns a commit dictionary representing uncommitted changes.
         """
-        uncommitted_changes = self.uncommitted_changes
+        uncommitted_changes = self._uncommitted_changes
         if not uncommitted_changes:
             return {}
         commit = {
             "remote": self._remote.url,
-            "changes": self.uncommitted_changes,
+            "changes": self._uncommitted_changes,
             "date": str(datetime.datetime.now()),
         }
         commit.update(self.context_dict)
         return commit
 
-    def is_issued_commit(self, commit: dict) -> bool:
-        """
-        Args:
-            commit (dict): The commit dictionary to check for.
-
-        Returns:
-            bool: Whether the commit was issued by the current context.
-        """
-        context_dict = self.context_dict
-        diff_keys = set()
-        for diff in dictdiffer.diff(context_dict, commit):
-            if diff[0] == "change":
-                diff_keys.add(diff[1])
-            elif diff[0] in ("add", "remove"):
-                diff_keys = diff_keys.union([key[0] for key in diff[2]])
-        intersection = set(context_dict.keys()).intersection(diff_keys)
-        return not intersection
-
-    def is_issued_uncommitted_changes_commit(self, commit: dict) -> bool:
-        """
-        Args:
-            commit (dict): Description
-
-        Returns:
-            bool:
-                Whether the commit represents uncommitted changes and is issued by the
-                current context.
-        """
-        if not self.is_uncommitted_changes_commit(commit):
-            return False
-        return self.is_issued_commit(commit)
-
-    def accumulate_local_only_commits(
-        self, start: git.objects.Commit, local_commits: list
+    def _accumulate_local_only_commits(
+        self, start: git.Commit, local_commits: List[dict]
     ):
         """Accumulates a list of local only commit starting from the provided commit.
 
@@ -451,17 +332,29 @@ class Repository:
             start (git.objects.Commit):
                 The commit that we start peeling from last commit.
         """
-        # TODO: Maybe there is a way to get this information using pure Python.
+        from .commit import Commit  # pylint: disable=import-outside-toplevel
+
         if self._managed_repository.git.branch("--remotes", "--contains", start.hexsha):
             return
-        commit_dict = self.get_commit_dict(start)
-        commit_dict.update(self.context_dict)
-        commit_dict["branches"] = {"local": self.get_commit_branches(start.hexsha)}
-        # TODO: Maybe we should compare the SHA here.
-        if commit_dict not in local_commits:
-            local_commits.append(commit_dict)
+
+        commit = Commit(self)
+        commit.update_with_sha(start.hexsha)
+        commit.update_context()
+
+        # TODO: We should find a way to batch these calls as they are expensive.
+        changes = asyncio.run(self.batch.get_commits_changes([commit]))
+        commit["changes"] = changes[0]
+
+        # commits = asyncio.run(self.batch.get_commits_dicts([start]))
+        branches_list = asyncio.run(self.batch.get_commits_branches([commit]))
+        branches = branches_list[0] if branches_list else []
+        commit["branches"] = {"local": branches}
+
+        # Maybe we should compare the SHA here.
+        if commit not in local_commits:
+            local_commits.append(commit)
         for parent in start.parents:
-            self.accumulate_local_only_commits(parent, local_commits)
+            self._accumulate_local_only_commits(parent, local_commits)
 
     @property
     def context_dict(self) -> dict:
@@ -475,7 +368,7 @@ class Repository:
             "clone": get_real_path(self.working_dir),
         }
 
-    def get_local_only_commits(self, claims: List[str] = None) -> list:
+    def get_local_only_commits(self) -> list:
         """
         Returns:
             list:
@@ -485,30 +378,20 @@ class Repository:
         local_commits = []
         # We are collecting local commit for all local branches.
         for branch in self._managed_repository.branches:
-            self.accumulate_local_only_commits(branch.commit, local_commits)
+            self._accumulate_local_only_commits(branch.commit, local_commits)
         if self.config.get("track_uncommitted"):
             uncommitted_changes_commit = self.uncommitted_changes_commit
-
-            # Adding file we want to claim to the uncommitted changes commit.
-            for claim in claims or []:
-                claim = self.get_absolute_path(claim)
-                if os.path.isfile(claim):
-                    uncommitted_changes_commit.setdefault("changes", []).append(
-                        self.get_relative_path(claim).replace("\\", "/")
-                    )
-
             if uncommitted_changes_commit:
                 local_commits.insert(0, uncommitted_changes_commit)
         local_commits.sort(key=lambda commit: commit.get("date"), reverse=True)
         return local_commits
 
     @property
-    def uncommitted_changes(self) -> list:
+    def _uncommitted_changes(self) -> list:
         """
         Returns:
             list: A list of unique relative filenames that feature uncommitted changes.
         """
-        # TODO: Maybe there is a way to get this information using pure Python.
         git_cmd = self._managed_repository.git
         output = git_cmd.ls_files("--exclude-standard", "--others")
         untracked_changes = output.split("\n") if output else []
@@ -519,50 +402,7 @@ class Repository:
         # A file can be in both in untracked and staged changes. The set fixes that.
         return list(set(untracked_changes + changes + staged_changes))
 
-    def get_commit_dict(self, commit: git.objects.Commit) -> dict:
-        """
-        Args:
-            commit (git.objects.Commit): The commit to get as a dict.
-
-        Returns:
-            dict: A simplified JSON serializable dict that represents the commit.
-        """
-        changes = []
-        for change in list(commit.stats.files.keys()):
-            changes += get_filenames_from_move_string(change)
-        return {
-            "sha": commit.hexsha,
-            "remote": self._remote.url,
-            "changes": changes,
-            "date": str(commit.committed_datetime),
-            "author": commit.author.name,
-        }
-
-    def get_commit_branches(self, sha: str, remote: bool = False) -> list:
-        """
-        Args:
-            sha (str): The sha of the commit to check for.
-            remote (bool, optional): Whether we should return local or remote branches.
-
-        Returns:
-            list: A list of branch names that this commit is living on.
-        """
-        args = ["--remote" if remote else []]
-        args += ["--contains", sha]
-        try:
-            branches = self._managed_repository.git.branch(*args)
-        # If the commit is not on any branch we get a git.exc.GitCommandError.
-        except git.exc.GitCommandError:
-            return []
-        branches = branches.replace("*", "")
-        branches = branches.replace(" ", "")
-        branches = branches.split("\n") if branches else []
-        branch_names = set()
-        for branch in branches:
-            branch_names.add(branch.split("/")[-1])
-        return list(branch_names)
-
-    def is_ignored(self, filename: str) -> bool:
+    def _is_ignored(self, filename: str) -> bool:
         """
         Args:
             filename (str): The filename to check for.
@@ -578,29 +418,6 @@ class Repository:
             return False
 
     @property
-    def submodules(self) -> list:
-        """
-        Returns:
-            TYPE: A list of submodule relative filenames.
-        """
-        if self._submodules is None:
-            self._submodules = [_.name for _ in self._managed_repository.submodules]
-        return self._submodules
-
-    def is_submodule_file(self, filename) -> bool:
-        """
-        Args:
-            filename (TYPE): Description
-
-        Returns:
-            TYPE: Whether an absolute or relative filename belongs to a submodule.
-        """
-        for submodule in self.submodules:
-            if self.get_relative_path(filename).startswith(submodule):
-                return True
-        return False
-
-    @property
     def files(self) -> list:
         """
         Returns:
@@ -610,8 +427,7 @@ class Repository:
         """
         git_cmd = self._managed_repository.git
         try:
-            # TODO: HEAD might not be safe here since user could checkout an earlier
-            # commit.
+            # TODO: HEAD might not be safe. The user could checkout an earlier commit.
             filenames = git_cmd.ls_tree(full_tree=True, name_only=True, r="HEAD")
             return filenames.split("\n")
         except git.exc.GitCommandError:
@@ -628,10 +444,10 @@ class Repository:
         local_changes = set()
         for commit in self.get_local_only_commits():
             local_changes = local_changes.union(commit.get("changes", []))
-        return local_changes
+        return list(local_changes)
 
     def update_file_permissions(
-        self, filename: str, locally_changed_files: list = None
+        self, filename: str, locally_changed_files: Optional[list] = None
     ) -> tuple:
         """Updates the permissions of a file based on them being locally changed.
 
@@ -645,7 +461,7 @@ class Repository:
             tuple: A tuple featuring the permission and the filename.
         """
         locally_changed_files = locally_changed_files or self.locally_changed_files
-        if self.is_file_tracked(filename):
+        if self._is_file_tracked(filename):
             read_only = self.get_relative_path(filename) not in locally_changed_files
             if set_read_only(
                 self.get_absolute_path(filename),
@@ -655,7 +471,7 @@ class Repository:
                 return "R" if read_only else "W", filename
         return ()
 
-    def is_file_tracked(self, filename: str) -> bool:
+    def _is_file_tracked(self, filename: str) -> bool:
         """
         Args:
             filename (str): The absolute or relative file or folder path to check for.
@@ -663,7 +479,7 @@ class Repository:
         Returns:
             bool: Whether the file is tracked by Gitalong.
         """
-        if self.is_ignored(filename):
+        if self._is_ignored(filename):
             return False
         tracked_extensions = self.config.get("tracked_extensions", [])
         if os.path.splitext(filename)[-1] in tracked_extensions:
@@ -673,50 +489,19 @@ class Repository:
             self.get_absolute_path(filename)
         )
 
-    def make_file_writable(
-        self,
-        filename: str,
-        prune: bool = True,
-    ) -> dict:
-        """Make a file writable if it's not missing with other tracked commits that
-        aren't present locally.
-
-        Args:
-            filename (str):
-                The file to make writable. Takes a path that's absolute or relative to
-                the managed repository.
-            prune (bool, optional): Prune branches if a fetch is necessary.
-
-        Returns:
-            dict: The missing commit that we are missing.
-        """
-        last_commit = self.get_file_last_commit(filename, prune=prune)
-        spread = self.get_commit_spread(last_commit)
-        is_local_commit = (
-            spread & CommitSpread.MINE_ACTIVE_BRANCH == CommitSpread.MINE_ACTIVE_BRANCH
-        )
-        is_uncommitted = (
-            spread & CommitSpread.MINE_UNCOMMITTED == CommitSpread.MINE_UNCOMMITTED
-        )
-        missing_commit = {} if is_local_commit or is_uncommitted else last_commit
-        if os.path.exists(filename):
-            if not missing_commit:
-                set_read_only(filename, bool(missing_commit))
-        return missing_commit
-
     @property
-    def working_dir(self):
+    def working_dir(self) -> str:
         """
         Returns:
             str: The working directory of the managed repository.
         """
-        return self._managed_repository.working_dir
+        return str(self._managed_repository.working_dir)
 
-    def update_tracked_commits(self, claims: List[str] = None):
+    def update_tracked_commits(self):
         """Pulls the tracked commits from the store and updates them."""
-        self._store.commits = self.get_updated_tracked_commits(claims=claims)
+        self._store.commits = self._get_updated_tracked_commits()
 
-    def get_updated_tracked_commits(self, claims: List[str] = None) -> list:
+    def _get_updated_tracked_commits(self) -> list:
         """
         Returns:
             list:
@@ -729,17 +514,57 @@ class Repository:
         for commit in self._store.commits:
             remote = self._remote.url
             is_other_remote = commit.get("remote") != remote
-            if self._is_valid_commit(commit) and (
-                is_other_remote or not self.is_issued_commit(commit)
+            if "changes" in commit.keys() and (
+                is_other_remote or not commit.is_issued_commit()
             ):
                 tracked_commits.append(commit)
                 continue
         # Adding all local commit to the list of tracked commits.
         # Will include uncommitted changes as a "fake" commit.
-        for commit in self.get_local_only_commits(claims=claims):
+        for commit in self.get_local_only_commits():
             tracked_commits.append(commit)
         return tracked_commits
 
-    @staticmethod
-    def _is_valid_commit(com: dict) -> bool:
-        return "changes" in com.keys()
+    def pulled_within(self, seconds: float) -> bool:
+        """
+        Args:
+            seconds (float): Time in seconds since last push.
+
+        Returns:
+            TYPE: Whether the repository pulled within the time provided.
+        """
+        return pulled_within(self._managed_repository, seconds)
+
+    def log(self, message: str):
+        """Logs a message to the managed repository.
+
+        Args:
+            message (str): The message to log.
+        """
+        self._managed_repository.git.log(message)
+
+    @property
+    def git(self) -> git.Git:
+        """
+        Returns:
+            git.cmd.Git: The Git command line interface for the managed repository.
+        """
+        return self._managed_repository.git
+
+    @property
+    def batch(self):
+        """
+        Returns:
+            Batch: The batch object for the managed repository.
+        """
+        from . import batch  # pylint: disable=import-outside-toplevel
+
+        return batch
+
+    @property
+    def active_branch_name(self) -> str:
+        """
+        Returns:
+            str: The name of the active branch.
+        """
+        return self._managed_repository.active_branch.name

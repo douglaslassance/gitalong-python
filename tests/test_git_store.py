@@ -1,3 +1,5 @@
+# pylint: disable=missing-class-docstring
+
 import os
 import tempfile
 
